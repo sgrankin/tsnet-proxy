@@ -135,7 +135,7 @@ func setAuthHeaders(lc *tailscale.LocalClient, next http.Handler) http.Handler {
 		}
 		r.Header.Set("Tailscale-Name", who.UserProfile.DisplayName)
 		r.Header.Set("Tailscale-User", who.UserProfile.LoginName)
-		r.Header.Set("Tailscale-Login", strings.Split("@", who.UserProfile.LoginName)[0])
+		r.Header.Set("Tailscale-Login", strings.Split(who.UserProfile.LoginName, "@")[0])
 		r.Header.Set("Tailscale-Profile-Picture", who.UserProfile.ProfilePicURL)
 		tailnet, _ := strings.CutPrefix(who.Node.Name, who.Node.ComputedName+".")
 		r.Header.Set("Tailscale-Tailnet", tailnet)
