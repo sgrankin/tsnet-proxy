@@ -11,17 +11,19 @@ import (
 	"net/url"
 	"strings"
 
+	"tailscale.com/client/tailscale"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tsnet"
 	"tailscale.com/util/dnsname"
 )
 
 var (
-	hostname = flag.String("hostname", "", "hostname to use on the tailnet")
-	toAddr   = flag.String("to-addr", "127.0.0.1:80", "address to forward requests to")
-	toNet    = flag.String("to-net", "tcp", "type of to-addr")
-	useHTTPS = flag.Bool("https", true, "serve golink over HTTPS if enabled on tailnet")
-	verbose  = flag.Bool("verbose", false, "be verbose")
+	configDir = flag.String("config-dir", "", "directory to use for tailnet state")
+	hostname  = flag.String("hostname", "", "hostname to use on the tailnet")
+	toAddr    = flag.String("to-addr", "127.0.0.1:80", "address to forward requests to")
+	toNet     = flag.String("to-net", "tcp", "type of to-addr")
+	useHTTPS  = flag.Bool("https", true, "serve golink over HTTPS if enabled on tailnet")
+	verbose   = flag.Bool("verbose", false, "be verbose")
 )
 
 func main() {
@@ -32,8 +34,13 @@ func main() {
 
 	srv := &tsnet.Server{
 		Hostname: *hostname,
+		Logf:     func(format string, args ...any) {},
+		Dir:      *configDir,
 	}
 	defer srv.Close()
+	if *verbose {
+		srv.Logf = log.Printf
+	}
 
 	localClient, err := srv.LocalClient()
 	if err != nil {
@@ -49,17 +56,22 @@ func main() {
 	enableTLS := *useHTTPS && status.Self.HasCap(tailcfg.CapabilityHTTPS) && len(srv.CertDomains()) > 0
 	fqdn := strings.TrimSuffix(status.Self.DNSName, ".")
 
-	var httpHandler http.Handler = &httputil.ReverseProxy{
+	var handler http.Handler = &httputil.ReverseProxy{
+		Director: func(r *http.Request) {
+			r.URL.Scheme = "http"
+			r.URL.Host = *hostname
+		},
 		Transport: &http.Transport{
 			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 				return net.Dial(*toNet, *toAddr)
 			},
 		},
 	}
+	handler = setAuthHeaders(localClient, handler)
 
 	if enableTLS {
-		httpsHandler := HSTS(httpHandler)
-		httpHandler = redirectHandler(fqdn)
+		httpsHandler := HSTS(handler)
+		handler = redirectHandler(fqdn)
 
 		httpsListener, err := srv.ListenTLS("tcp", ":443")
 		if err != nil {
@@ -81,7 +93,7 @@ func main() {
 	}
 	defer httpListener.Close()
 	log.Println("Listening on :80")
-	if err := http.Serve(httpListener, httpHandler); err != nil {
+	if err := http.Serve(httpListener, handler); err != nil {
 		log.Panic(err)
 	}
 }
@@ -111,5 +123,22 @@ func HSTS(h http.Handler) http.Handler {
 func redirectHandler(hostname string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, (&url.URL{Scheme: "https", Host: hostname, Path: r.URL.Path}).String(), http.StatusFound)
+	})
+}
+
+func setAuthHeaders(lc *tailscale.LocalClient, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		who, err := lc.WhoIs(r.Context(), r.RemoteAddr)
+		if err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		r.Header.Set("Tailscale-Name", who.UserProfile.DisplayName)
+		r.Header.Set("Tailscale-User", who.UserProfile.LoginName)
+		r.Header.Set("Tailscale-Login", strings.Split("@", who.UserProfile.LoginName)[0])
+		r.Header.Set("Tailscale-Profile-Picture", who.UserProfile.ProfilePicURL)
+		tailnet, _ := strings.CutPrefix(who.Node.Name, who.Node.ComputedName+".")
+		r.Header.Set("Tailscale-Tailnet", tailnet)
+		next.ServeHTTP(w, r)
 	})
 }
