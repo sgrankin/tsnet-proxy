@@ -1,15 +1,25 @@
+// Copyright 2024 Sergey Grankin
+// Copyright 2022 Tailscale Inc & Contributors
+// SPDX-License-Identifier: BSD-3-Clause
+
 // tsnet-proxy exposes an HTTP server the tailnet.
 package main
 
 import (
 	"context"
+	"errors"
 	"flag"
+	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"regexp"
 	"strings"
+
+	"golang.org/x/sync/errgroup"
 
 	"tailscale.com/client/tailscale"
 	"tailscale.com/tailcfg"
@@ -17,85 +27,202 @@ import (
 	"tailscale.com/util/dnsname"
 )
 
-var (
-	configDir = flag.String("config-dir", "", "directory to use for tailnet state")
-	hostname  = flag.String("hostname", "", "hostname to use on the tailnet")
-	toAddr    = flag.String("to-addr", "127.0.0.1:80", "address to forward requests to")
-	toNet     = flag.String("to-net", "tcp", "type of to-addr")
-	useHTTPS  = flag.Bool("https", true, "serve golink over HTTPS if enabled on tailnet")
-	verbose   = flag.Bool("verbose", false, "be verbose")
-)
-
 func main() {
+	var (
+		configDir = flag.String("config-dir", "", "Directory to use for tailnet state")
+		hostname  = flag.String("hostname", "", "Hostname to use on the tailnet")
+		httpAddr  = flag.String("http", "127.0.0.1:80", "Address to forward HTTP requests to")
+		useHTTPS  = flag.Bool("https", true, "Serve over HTTPS if enabled on the tailnet")
+		verbose   = flag.Bool("verbose", false, "Be verbose")
+		proxyConf = proxyConfFlag("forward", "Forward extra ports.  FROM_PORT[:TO_ADDR]:TO_PORT[/NETWORK]")
+	)
 	flag.Parse()
 	if *hostname == "" {
 		log.Fatal("-hostname is required")
 	}
-
 	srv := &tsnet.Server{
 		Hostname: *hostname,
 		Logf:     func(format string, args ...any) {},
 		Dir:      *configDir,
 	}
-	defer srv.Close()
 	if *verbose {
 		srv.Logf = log.Printf
 	}
 
+	if err := run(srv, *httpAddr, *useHTTPS, *proxyConf); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func run(srv *tsnet.Server, httpAddr string, useHTTPS bool, proxyConf []proxyConf) error {
 	localClient, err := srv.LocalClient()
 	if err != nil {
-		log.Panic(err)
+		return err
 	}
 
 	ctx := context.Background()
 	status, err := localClient.Status(ctx)
 	if err != nil {
-		log.Panic(err)
+		return err
 	}
 
-	enableTLS := *useHTTPS && status.Self.HasCap(tailcfg.CapabilityHTTPS) && len(srv.CertDomains()) > 0
+	enableTLS := useHTTPS && status.Self.HasCap(tailcfg.CapabilityHTTPS) && len(srv.CertDomains()) > 0
 	fqdn := strings.TrimSuffix(status.Self.DNSName, ".")
 
 	var handler http.Handler = &httputil.ReverseProxy{
 		Director: func(r *http.Request) {
 			r.URL.Scheme = "http"
-			r.URL.Host = *hostname
+			r.URL.Host = srv.Hostname
 		},
 		Transport: &http.Transport{
 			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-				return net.Dial(*toNet, *toAddr)
+				return net.Dial("tcp", httpAddr)
 			},
 		},
 	}
 	handler = setAuthHeaders(localClient, handler)
 
+	g, ctx := errgroup.WithContext(ctx)
 	if enableTLS {
-		httpsHandler := HSTS(handler)
-		handler = redirectHandler(fqdn)
-
-		httpsListener, err := srv.ListenTLS("tcp", ":443")
-		if err != nil {
-			log.Panic(err)
-		}
-		defer httpsListener.Close()
 		log.Println("Listening on :443")
+		log.Printf("Serving https://%s/ ...", fqdn)
+		g.Go(func() error { return listenHTTPS(srv, handler, ":443") })
+		handler = redirectHandler(fqdn)
+	}
+	g.Go(func() error {
+		log.Println("Listening on :80")
+		return listenHTTP(srv, handler, ":80")
+	})
+	for _, pc := range proxyConf {
+		g.Go(func() error {
+			log.Println("Proxying %+v", pc)
+			return proxy(srv, pc.network, pc.listenAddr, pc.dialAddr)
+		})
+	}
+	go func() {
+		<-ctx.Done()
+		srv.Close()
+	}()
+	return g.Wait()
+}
+
+type proxyConf struct {
+	network    string
+	listenAddr string
+	dialAddr   string
+}
+
+func proxyConfFlag(name, usage string) *[]proxyConf {
+	r := regexp.MustCompile(`^(?P<port>\d+):(:(?P<addr>.+))?:(?P<toPort>\d+)(/(?P<network>\w+))?$`)
+	value := &[]proxyConf{}
+	flag.Func(name, usage, func(s string) error {
+		matched := match(r, s)
+		if matched == nil {
+			return fmt.Errorf("value %q must match regexp %v", s, r)
+		}
+		if matched["addr"] == "" {
+			matched["addr"] = "127.0.0.1"
+		}
+		conf := proxyConf{
+			network:    matched["network"],
+			listenAddr: ":" + matched["port"],
+			dialAddr:   matched["addr"] + ":" + matched["toPort"],
+		}
+		*value = append(*value, conf)
+		return nil
+	})
+	return value
+}
+
+func match(r *regexp.Regexp, s string) map[string]string {
+	match := r.FindStringSubmatch(s)
+	if match == nil {
+		return nil
+	}
+	result := map[string]string{}
+	for i, name := range r.SubexpNames() {
+		if i != 0 && name != "" {
+			result[name] = match[i]
+		}
+	}
+	return result
+}
+
+// proxy forwards connections from listeAddr to dialAddr.
+// All standard network types are supported.
+func proxy(srv *tsnet.Server, network, listenAdr, dialAddr string) error {
+	lis, err := srv.Listen(network, listenAdr)
+	if err != nil {
+		return err
+	}
+	defer lis.Close()
+	for {
+		conn1, err := lis.Accept()
+		if err != nil {
+			if errors.Is(err, net.ErrClosed) {
+				err = nil
+			}
+			return err
+		}
+		defer conn1.Close()
+		log.Printf("Accepted connection on %s", listenAdr)
+		conn2, err := net.Dial(network, dialAddr)
+		if err != nil {
+			return err
+		}
 		go func() {
-			log.Printf("Serving https://%s/ ...", fqdn)
-			if err := http.Serve(httpsListener, httpsHandler); err != nil {
-				log.Fatal(err)
+			if err := pipe(conn1, conn2); err != nil {
+				log.Printf("Error while piping %s->%s: %v", listenAdr, dialAddr, err)
 			}
 		}()
 	}
+}
 
-	httpListener, err := srv.Listen("tcp", ":80")
+// pipe connects two connections and bidirectionally copies data between them.
+func pipe(conn1, conn2 net.Conn) error {
+	defer conn1.Close()
+	defer conn2.Close()
+
+	g := errgroup.Group{}
+	closingCopy := func(conn1, conn2 net.Conn) error {
+		_, err := io.Copy(conn1, conn2)
+		// If the connection can be partially closed, signal that there is no more data coming.
+		if wc, ok := conn1.(interface {
+			CloseWrite() error
+		}); ok {
+			wc.CloseWrite()
+		}
+		return err
+	}
+	g.Go(func() error { return closingCopy(conn1, conn2) })
+	g.Go(func() error { return closingCopy(conn2, conn1) })
+	return g.Wait()
+}
+
+func listenHTTPS(srv *tsnet.Server, handler http.Handler, addr string) error {
+	httpsHandler := HSTS(handler)
+	httpsListener, err := srv.ListenTLS("tcp", addr)
 	if err != nil {
-		log.Panic(err)
+		return err
+	}
+	defer httpsListener.Close()
+	if err := http.Serve(httpsListener, httpsHandler); err != nil {
+		return err
+	}
+	return nil
+}
+
+func listenHTTP(srv *tsnet.Server, handler http.Handler, addr string) error {
+	httpListener, err := srv.Listen("tcp", addr)
+	if err != nil {
+		return err
 	}
 	defer httpListener.Close()
-	log.Println("Listening on :80")
 	if err := http.Serve(httpListener, handler); err != nil {
-		log.Panic(err)
+		return err
 	}
+	return nil
+
 }
 
 // HSTS wraps the provided handler and sets Strict-Transport-Security header on
@@ -126,6 +253,7 @@ func redirectHandler(hostname string) http.Handler {
 	})
 }
 
+// setAuthHeaders adds Tailscale-* headers populated with the authenticated user's info.
 func setAuthHeaders(lc *tailscale.LocalClient, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		who, err := lc.WhoIs(r.Context(), r.RemoteAddr)
