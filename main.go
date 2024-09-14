@@ -20,9 +20,9 @@ import (
 	"strings"
 
 	"golang.org/x/sync/errgroup"
+	"tailscale.com/tailcfg"
 
 	"tailscale.com/client/tailscale"
-	"tailscale.com/tailcfg"
 	"tailscale.com/tsnet"
 	"tailscale.com/util/dnsname"
 )
@@ -41,9 +41,10 @@ func main() {
 		log.Fatal("-hostname is required")
 	}
 	srv := &tsnet.Server{
-		Hostname: *hostname,
-		Logf:     func(format string, args ...any) {},
-		Dir:      *configDir,
+		Hostname:     *hostname,
+		Logf:         func(format string, args ...any) {},
+		Dir:          *configDir,
+		RunWebClient: true,
 	}
 	if *verbose {
 		srv.Logf = log.Printf
@@ -55,19 +56,24 @@ func main() {
 }
 
 func run(srv *tsnet.Server, httpAddr string, useHTTPS bool, proxyConf []proxyConf) error {
+	ctx := context.Background()
+	if err := srv.Start(); err != nil {
+		return err
+	}
+
 	localClient, err := srv.LocalClient()
 	if err != nil {
 		return err
 	}
 
-	ctx := context.Background()
+	// Wait for tailscale to come up...
+	if _, err := srv.Up(ctx); err != nil {
+		return fmt.Errorf("tailcale up: %v", err)
+	}
 	status, err := localClient.Status(ctx)
 	if err != nil {
-		return err
+		return fmt.Errorf("tailscale status: %v", err)
 	}
-
-	enableTLS := useHTTPS && status.Self.HasCap(tailcfg.CapabilityHTTPS) && len(srv.CertDomains()) > 0
-	fqdn := strings.TrimSuffix(status.Self.DNSName, ".")
 
 	var handler http.Handler = &httputil.ReverseProxy{
 		Director: func(r *http.Request) {
@@ -82,11 +88,18 @@ func run(srv *tsnet.Server, httpAddr string, useHTTPS bool, proxyConf []proxyCon
 	}
 	handler = setAuthHeaders(localClient, handler)
 
+	enableTLS := useHTTPS && status.Self.HasCap(tailcfg.CapabilityHTTPS) && len(srv.CertDomains()) > 0
+	fqdn := strings.TrimSuffix(status.Self.DNSName, ".")
+	if useHTTPS && !enableTLS {
+		return fmt.Errorf("HTTPS requested but unavailable; check your tailscale config")
+	}
+
 	g, ctx := errgroup.WithContext(ctx)
 	if enableTLS {
-		log.Print("Listening on :443, Serving https://%s/ ...", fqdn)
+		log.Printf("Listening on :443, Serving https://%s/ ...", fqdn)
+		httpsHandler := handler
 		g.Go(func() error {
-			return listenHTTPS(srv, handler, ":443")
+			return listenHTTPS(srv, httpsHandler, ":443")
 		})
 		handler = redirectHandler(fqdn)
 	}
@@ -115,12 +128,15 @@ type proxyConf struct {
 }
 
 func proxyConfFlag(name, usage string) *[]proxyConf {
-	r := regexp.MustCompile(`^(?P<port>\d+):(:(?P<addr>.+))?:(?P<toPort>\d+)(/(?P<network>\w+))?$`)
+	r := regexp.MustCompile(`^(?P<port>\d+)(:(?P<addr>.+))?:(?P<toPort>\d+)(/(?P<network>\w+))?$`)
 	value := &[]proxyConf{}
 	flag.Func(name, usage, func(s string) error {
 		matched := match(r, s)
 		if matched == nil {
 			return fmt.Errorf("value %q must match regexp %v", s, r)
+		}
+		if matched["network"] == "" {
+			matched["network"] = "tcp"
 		}
 		if matched["addr"] == "" {
 			matched["addr"] = "127.0.0.1"
