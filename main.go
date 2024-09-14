@@ -84,25 +84,27 @@ func run(srv *tsnet.Server, httpAddr string, useHTTPS bool, proxyConf []proxyCon
 
 	g, ctx := errgroup.WithContext(ctx)
 	if enableTLS {
-		log.Println("Listening on :443")
-		log.Printf("Serving https://%s/ ...", fqdn)
-		g.Go(func() error { return listenHTTPS(srv, handler, ":443") })
+		log.Print("Listening on :443, Serving https://%s/ ...", fqdn)
+		g.Go(func() error {
+			return listenHTTPS(srv, handler, ":443")
+		})
 		handler = redirectHandler(fqdn)
 	}
 	g.Go(func() error {
-		log.Println("Listening on :80")
+		log.Print("Listening on :80")
 		return listenHTTP(srv, handler, ":80")
 	})
 	for _, pc := range proxyConf {
 		g.Go(func() error {
-			log.Println("Proxying %+v", pc)
+			log.Printf("Proxying %+v", pc)
 			return proxy(srv, pc.network, pc.listenAddr, pc.dialAddr)
 		})
 	}
-	go func() {
+	g.Go(func() error {
+		// If any listener errors out, shut down the server (which in turn closes down all other listeners).
 		<-ctx.Done()
-		srv.Close()
-	}()
+		return srv.Close()
+	})
 	return g.Wait()
 }
 
@@ -148,7 +150,7 @@ func match(r *regexp.Regexp, s string) map[string]string {
 	return result
 }
 
-// proxy forwards connections from listeAddr to dialAddr.
+// proxy forwards connections from listenAddr to dialAddr.
 // All standard network types are supported.
 func proxy(srv *tsnet.Server, network, listenAdr, dialAddr string) error {
 	lis, err := srv.Listen(network, listenAdr)
