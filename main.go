@@ -7,6 +7,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"flag"
 	"fmt"
@@ -60,7 +61,7 @@ func run(srv *tsnet.Server, httpAddr string, useHTTPS bool, proxyConf []proxyCon
 		return err
 	}
 
-	localClient, err := srv.LocalClient()
+	lc, err := srv.LocalClient()
 	if err != nil {
 		return err
 	}
@@ -69,7 +70,7 @@ func run(srv *tsnet.Server, httpAddr string, useHTTPS bool, proxyConf []proxyCon
 	if _, err := srv.Up(ctx); err != nil {
 		return fmt.Errorf("tailcale up: %v", err)
 	}
-	status, err := localClient.Status(ctx)
+	status, err := lc.Status(ctx)
 	if err != nil {
 		return fmt.Errorf("tailscale status: %v", err)
 	}
@@ -98,14 +99,14 @@ func run(srv *tsnet.Server, httpAddr string, useHTTPS bool, proxyConf []proxyCon
 			return nil
 		},
 	}
-	handler = setAuthHeaders(localClient, handler)
+	handler = setAuthHeaders(lc, handler)
 
 	g, ctx := errgroup.WithContext(ctx)
 	if enableTLS {
 		log.Printf("Listening on :443, Serving https://%s/ ...", fqdn)
 		httpsHandler := handler
 		g.Go(func() error {
-			return listenHTTPS(srv, httpsHandler, ":443")
+			return listenHTTPS(srv, lc, httpsHandler, ":443")
 		})
 		handler = redirectHandler(fqdn)
 	}
@@ -222,11 +223,15 @@ func pipe(conn1, conn2 net.Conn) error {
 	return g.Wait()
 }
 
-func listenHTTPS(srv *tsnet.Server, handler http.Handler, addr string) error {
-	lis, err := srv.ListenTLS("tcp", addr)
+func listenHTTPS(srv *tsnet.Server, lc *tailscale.LocalClient, handler http.Handler, addr string) error {
+	lis, err := srv.Listen("tcp", addr)
 	if err != nil {
 		return err
 	}
+	lis = tls.NewListener(lis, &tls.Config{
+		GetCertificate: lc.GetCertificate,
+		NextProtos:     []string{"h2", "http/1.1"}, // Enable HTTP/2.
+	})
 	defer lis.Close()
 	return http.Serve(lis, handler)
 }
@@ -245,7 +250,10 @@ func listenHTTP(srv *tsnet.Server, handler http.Handler, addr string) error {
 func redirectHandler(hostname string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r,
-			(&url.URL{Scheme: "https", Host: hostname, Path: r.URL.Path}).String(),
+			(&url.URL{Scheme: "https",
+				Host:     hostname,
+				Path:     r.URL.Path,
+				RawQuery: r.URL.RawQuery}).String(),
 			http.StatusPermanentRedirect)
 	})
 }
