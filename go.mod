@@ -7,7 +7,7 @@ toolchain go1.23.1
 require (
 	github.com/quic-go/quic-go v0.47.0
 	golang.org/x/sync v0.8.0
-	tailscale.com v1.74.0
+	tailscale.com v1.74.1
 )
 
 require (
