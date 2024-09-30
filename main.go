@@ -16,10 +16,12 @@ import (
 	"net"
 	"net/http"
 	"net/http/httputil"
+	"net/netip"
 	"net/url"
 	"regexp"
 	"strings"
 
+	"github.com/quic-go/quic-go/http3"
 	"golang.org/x/sync/errgroup"
 	"tailscale.com/tailcfg"
 
@@ -91,13 +93,6 @@ func run(srv *tsnet.Server, httpAddr string, useHTTPS bool, proxyConf []proxyCon
 				return net.Dial("tcp", httpAddr)
 			},
 		},
-		ModifyResponse: func(response *http.Response) error {
-			if enableTLS {
-				// Set STS to have the browser always use https.
-				response.Header.Set("Strict-Transport-Security", "max-age=31536000")
-			}
-			return nil
-		},
 	}
 	handler = setAuthHeaders(lc, handler)
 
@@ -106,13 +101,13 @@ func run(srv *tsnet.Server, httpAddr string, useHTTPS bool, proxyConf []proxyCon
 		log.Printf("Listening on :443, Serving https://%s/ ...", fqdn)
 		httpsHandler := handler
 		g.Go(func() error {
-			return listenHTTPS(srv, lc, httpsHandler, ":443")
+			return listenHTTPS(ctx, srv, lc, httpsHandler, status.TailscaleIPs, 443)
 		})
 		handler = redirectHandler(fqdn)
 	}
 	g.Go(func() error {
 		log.Print("Listening on :80")
-		return listenHTTP(srv, handler, ":80")
+		return listenHTTP(srv, handler, 80)
 	})
 	for _, pc := range proxyConf {
 		g.Go(func() error {
@@ -223,21 +218,71 @@ func pipe(conn1, conn2 net.Conn) error {
 	return g.Wait()
 }
 
-func listenHTTPS(srv *tsnet.Server, lc *tailscale.LocalClient, handler http.Handler, addr string) error {
-	lis, err := srv.Listen("tcp", addr)
-	if err != nil {
-		return err
+func listenH3(srv *tsnet.Server, lc *tailscale.LocalClient, handler http.Handler, ips []netip.Addr, port uint16) error {
+	h3 := http3.Server{
+		TLSConfig: &tls.Config{GetCertificate: lc.GetCertificate},
+		Handler:   handler,
 	}
-	lis = tls.NewListener(lis, &tls.Config{
-		GetCertificate: lc.GetCertificate,
-		NextProtos:     []string{"h2", "http/1.1"}, // Enable HTTP/2.
-	})
-	defer lis.Close()
-	return http.Serve(lis, handler)
+	g := errgroup.Group{}
+	for _, ip := range ips {
+		pc, err := srv.ListenPacket("udp", netip.AddrPortFrom(ip, port).String())
+		if err != nil {
+			return err
+		}
+		g.Go(func() error {
+			defer pc.Close()
+			return h3.Serve(pc)
+		})
+	}
+	defer h3.Close()
+	return g.Wait()
 }
 
-func listenHTTP(srv *tsnet.Server, handler http.Handler, addr string) error {
-	lis, err := srv.Listen("tcp", addr)
+func listenHTTPS(ctx context.Context, srv *tsnet.Server, lc *tailscale.LocalClient, handler http.Handler, ips []netip.Addr, port uint16) error {
+	h3 := http3.Server{
+		TLSConfig: &tls.Config{GetCertificate: lc.GetCertificate},
+		Handler:   handler,
+	}
+	g, ctx := errgroup.WithContext(ctx)
+	for _, ip := range ips {
+		g.Go(func() error {
+			pc, err := srv.ListenPacket("udp", netip.AddrPortFrom(ip, port).String())
+			if err != nil {
+				return err
+			}
+			defer pc.Close()
+			return h3.Serve(pc)
+		})
+	}
+	h2 := http.Server{
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Strict-Transport-Security", "max-age=31536000")
+			h3.SetQUICHeaders(w.Header())
+			handler.ServeHTTP(w, r)
+		}),
+	}
+	g.Go(func() error {
+		lis, err := srv.Listen("tcp", fmt.Sprintf(":%d", port))
+		if err != nil {
+			return err
+		}
+		lis = tls.NewListener(lis, &tls.Config{
+			GetCertificate: lc.GetCertificate,
+			NextProtos:     []string{"h2", "http/1.1"}, // Enable HTTP/2.
+		})
+		defer lis.Close()
+		return h2.Serve(lis)
+	})
+	g.Go(func() error {
+		// If anything errored, or the original context was cancelled, shut down the servers (immediately).
+		<-ctx.Done()
+		return errors.Join(h2.Close(), h3.Close())
+	})
+	return g.Wait()
+}
+
+func listenHTTP(srv *tsnet.Server, handler http.Handler, port uint16) error {
+	lis, err := srv.Listen("tcp", fmt.Sprintf(":%d", port))
 	if err != nil {
 		return err
 	}
