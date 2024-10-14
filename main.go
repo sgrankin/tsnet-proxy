@@ -84,9 +84,11 @@ func run(srv *tsnet.Server, httpAddr string, useHTTPS bool, proxyConf []proxyCon
 	}
 
 	var handler http.Handler = &httputil.ReverseProxy{
-		Director: func(r *http.Request) {
-			r.URL.Scheme = "http"
-			r.URL.Host = srv.Hostname
+		Rewrite: func(pr *httputil.ProxyRequest) {
+			pr.Out.URL.Scheme = "http"
+			pr.Out.URL.Host = srv.Hostname
+			pr.Out.Host = pr.In.Host // Preserve the host header.
+			pr.SetXForwarded()
 		},
 		Transport: &http.Transport{
 			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
@@ -295,10 +297,12 @@ func listenHTTP(srv *tsnet.Server, handler http.Handler, port uint16) error {
 func redirectHandler(hostname string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r,
-			(&url.URL{Scheme: "https",
+			(&url.URL{
+				Scheme:   "https",
 				Host:     hostname,
 				Path:     r.URL.Path,
-				RawQuery: r.URL.RawQuery}).String(),
+				RawQuery: r.URL.RawQuery,
+			}).String(),
 			http.StatusPermanentRedirect)
 	})
 }
